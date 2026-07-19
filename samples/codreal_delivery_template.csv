@@ -1,0 +1,9 @@
+order_ref,phone,status,amount_collected,delivery_date,carrier,campaign_name
+CMD-2026-0001,0612345678,delivered,449.00,2026-07-10,Amana,Summer Meta Lookalike
+CMD-2026-0002,+212698765432,delivered,349.00,2026-07-11,Amana,Summer Meta Lookalike
+CMD-2026-0003,06 11 22 33 44,returned,0,2026-07-12,Chronopost,Summer Meta Lookalike
+CMD-2026-0004,0700112233,refused,0,2026-07-12,Amana,TikTok Broad COD
+CMD-2026-0005,00212655554444,delivered,499.00,2026-07-13,Amana,TikTok Broad COD
+CMD-2026-0006,0655554444,pending,0,2026-07-14,Amana,TikTok Broad COD
+CMD-2026-0007,0611223344,delivered,299.00,2026-07-14,Chronopost,Retargeting Meta
+CMD-2026-0008,0699887766,delivered,399.00,2026-07-15,Amana,Retargeting Meta
