@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { AppShell } from "@/components/AppShell";
 import { CampaignTable } from "@/components/CampaignTable";
 import {
@@ -15,6 +16,7 @@ import { formatMad } from "@/lib/format";
 
 export default function CampaignsPage() {
   const { user, accessToken } = useAuth();
+  const router = useRouter();
   const [campaigns, setCampaigns] = useState<CampaignMetrics[]>([]);
   const [raw, setRaw] = useState<Array<Record<string, unknown>>>([]);
   const [error, setError] = useState<string | null>(null);
@@ -34,6 +36,10 @@ export default function CampaignsPage() {
     }
   }, [user, accessToken]);
 
+  const handleAnalyzeCampaign = (campaignId: string) => {
+    router.push(`/dashboard?campaign_id=${encodeURIComponent(campaignId)}`);
+  };
+
   return (
     <AppShell title="Campagnes">
       {error ? <p className="mb-4 text-sm text-rose-600">{error}</p> : null}
@@ -42,7 +48,7 @@ export default function CampaignsPage() {
           ? "Données utilisateur (tri bénéfice net croissant)."
           : "Mode démo locale — connectez-vous pour vos campagnes."}
       </p>
-      <CampaignTable campaigns={campaigns} />
+      <CampaignTable campaigns={campaigns} onAnalyzeCampaign={handleAnalyzeCampaign} />
 
       {raw.length > 0 ? (
         <section className="mt-8">

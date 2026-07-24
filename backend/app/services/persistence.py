@@ -436,11 +436,51 @@ def process_and_persist_upload(
     }
 
 
-def compute_user_dashboard(user_id: str, return_fee: float = 25.0) -> dict[str, Any]:
-    """Load campaigns + matched orders from DB and compute KPIs."""
+def compute_user_dashboard(
+    user_id: str,
+    return_fee: float = 25.0,
+    days: int | None = None,
+    platform: str | None = None,
+) -> dict[str, Any]:
+    """Load campaigns + matched orders from DB and compute KPIs with optional filters."""
     campaigns = list_campaigns(user_id)
     matches = list_matches(user_id)
     all_orders = {o["id"]: o for o in list_orders(user_id)}
+
+    # Apply platform filter
+    if platform and platform.lower() != "all":
+        plat_lower = platform.lower()
+        campaigns = [c for c in campaigns if c.get("platform") == plat_lower]
+        campaign_ids = {c["id"] for c in campaigns}
+        matches = [m for m in matches if m.get("campaign_id") in campaign_ids]
+
+    # Apply date range filter (days)
+    if days is not None:
+        from datetime import timedelta
+        today = date.today()
+        filtered_orders = {}
+        for oid, o in all_orders.items():
+            d_str = o.get("delivery_date")
+            if not d_str:
+                continue
+            try:
+                o_date = date.fromisoformat(str(d_str))
+            except ValueError:
+                continue
+            
+            if days == 1:
+                if o_date == today:
+                    filtered_orders[oid] = o
+            elif days == 2:
+                if o_date == today - timedelta(days=1):
+                    filtered_orders[oid] = o
+            elif days in (7, 30):
+                if today - timedelta(days=days) <= o_date <= today:
+                    filtered_orders[oid] = o
+            else:
+                filtered_orders[oid] = o
+        all_orders = filtered_orders
+        matches = [m for m in matches if m.get("order_id") in all_orders]
 
     camp_inputs = [
         CampaignInput(
@@ -472,8 +512,19 @@ def compute_user_dashboard(user_id: str, return_fee: float = 25.0) -> dict[str, 
             )
         )
 
-    engine = CalculationEngine(default_return_fee=return_fee)
-    kpis = engine.compute_dashboard(camp_inputs, order_calcs)
+    # Load custom threshold settings
+    user_settings = get_user_settings(user_id)
+    fee = float(user_settings.get("return_fee_mad", return_fee))
+    t_roas = float(user_settings.get("target_roas", 2.00))
+    crit_rate = float(user_settings.get("critical_return_rate", 0.30))
+
+    engine = CalculationEngine(default_return_fee=fee)
+    kpis = engine.compute_dashboard(
+        camp_inputs,
+        order_calcs,
+        target_roas=t_roas,
+        critical_return_rate=crit_rate,
+    )
     kpis_dict = kpis_to_dict(kpis)
 
     # Persist stats snapshot
@@ -501,9 +552,14 @@ def compute_user_dashboard(user_id: str, return_fee: float = 25.0) -> dict[str, 
     except Exception:
         pass  # non-fatal if stats table insert fails
 
-    from app.services.alerts import build_alerts
+    from app.services.alerts import build_alerts, AlertRule as ServiceAlertRule
 
-    alerts = build_alerts(kpis.campaigns)
+    rules = ServiceAlertRule(
+        min_roas=t_roas,
+        max_return_rate=crit_rate,
+        min_net_profit=0.0,
+    )
+    alerts = build_alerts(kpis.campaigns, rules)
     alert_dicts = [a.to_dict() for a in alerts]
 
     return {
@@ -654,3 +710,56 @@ def seed_demo_for_user(user_id: str, email: str | None = None) -> dict[str, Any]
         error_count=0,
         return_fee=25.0,
     )
+
+
+def get_user_settings(user_id: str) -> dict:
+    """Load settings for a user. Bypasses if Supabase is not configured (pytest fallback)."""
+    from app.core.supabase_client import is_supabase_configured
+    if not is_supabase_configured():
+        return {
+            "user_id": user_id,
+            "return_fee_mad": 25.00,
+            "critical_return_rate": 0.30,
+            "target_roas": 2.00,
+        }
+    sb = get_supabase_admin()
+    try:
+        res = sb.table("user_settings").select("*").eq("user_id", user_id).limit(1).execute()
+        if res.data:
+            return res.data[0]
+    except Exception:
+        pass
+    return {
+        "user_id": user_id,
+        "return_fee_mad": 25.00,
+        "critical_return_rate": 0.30,
+        "target_roas": 2.00,
+    }
+
+
+def save_user_settings(
+    user_id: str,
+    return_fee_mad: float,
+    critical_return_rate: float,
+    target_roas: float,
+) -> dict:
+    """Save/update user configuration settings."""
+    from app.core.supabase_client import is_supabase_configured
+    payload = {
+        "user_id": user_id,
+        "return_fee_mad": return_fee_mad,
+        "critical_return_rate": critical_return_rate,
+        "target_roas": target_roas,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if not is_supabase_configured():
+        return payload
+
+    sb = get_supabase_admin()
+    found = sb.table("user_settings").select("user_id").eq("user_id", user_id).limit(1).execute()
+    if found.data:
+        res = sb.table("user_settings").update(payload).eq("user_id", user_id).execute()
+    else:
+        res = sb.table("user_settings").insert(payload).execute()
+    return res.data[0] if res.data else payload
+

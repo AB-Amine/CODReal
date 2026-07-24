@@ -83,6 +83,8 @@ class CalculationEngine:
         campaign: CampaignInput,
         orders: list[OrderForCalc],
         return_fee: float | None = None,
+        target_roas: float | None = None,
+        critical_return_rate: float | None = None,
     ) -> CampaignMetrics:
         fee = return_fee if return_fee is not None else self.default_return_fee
 
@@ -104,7 +106,13 @@ class CalculationEngine:
             (len(returned) + len(refused)) / closed if closed > 0 else None
         )
 
-        score, label = self._score(real_roas, net_profit, return_rate)
+        score, label = self._score(
+            real_roas,
+            net_profit,
+            return_rate,
+            target_roas=target_roas,
+            critical_return_rate=critical_return_rate,
+        )
 
         return CampaignMetrics(
             campaign_id=campaign.campaign_id,
@@ -131,6 +139,8 @@ class CalculationEngine:
         campaigns: list[CampaignInput],
         matched_orders: list[OrderForCalc],
         return_fee: float | None = None,
+        target_roas: float | None = None,
+        critical_return_rate: float | None = None,
     ) -> DashboardKPIs:
         by_campaign: dict[str, list[OrderForCalc]] = {}
         for o in matched_orders:
@@ -139,7 +149,11 @@ class CalculationEngine:
         metrics: list[CampaignMetrics] = []
         for c in campaigns:
             m = self.compute_campaign(
-                c, by_campaign.get(c.campaign_id, []), return_fee=return_fee
+                c,
+                by_campaign.get(c.campaign_id, []),
+                return_fee=return_fee,
+                target_roas=target_roas,
+                critical_return_rate=critical_return_rate,
             )
             metrics.append(m)
 
@@ -175,19 +189,32 @@ class CalculationEngine:
         real_roas: float | None,
         net_profit: float,
         return_rate: float | None,
+        target_roas: float | None = None,
+        critical_return_rate: float | None = None,
     ) -> tuple[str, str]:
         """Basic rule-based performance score (Phase 1 alerts foundation)."""
+        if target_roas is not None:
+            roas_excellent = target_roas * 1.25
+            roas_good = target_roas
+            roas_warning = target_roas * 0.5
+        else:
+            roas_excellent = ROAS_EXCELLENT
+            roas_good = ROAS_GOOD
+            roas_warning = ROAS_WARNING
+
+        crit_rate = critical_return_rate if critical_return_rate is not None else 0.25
+
         if real_roas is None:
             if net_profit < 0:
                 return "critical", "Perte — données ROAS insuffisantes"
             return "warning", "Données insuffisantes"
 
-        if real_roas >= ROAS_EXCELLENT and net_profit > 0:
+        if real_roas >= roas_excellent and net_profit > 0:
             return "excellent", "Très rentable"
-        if real_roas >= ROAS_GOOD and net_profit > 0:
+        if real_roas >= roas_good and net_profit > 0:
             return "good", "Rentable"
-        if real_roas >= ROAS_WARNING:
-            high_returns = return_rate is not None and return_rate > 0.25
+        if real_roas >= roas_warning:
+            high_returns = return_rate is not None and return_rate > crit_rate
             if high_returns:
                 return "warning", "ROAS limite — retours élevés"
             return "warning", "ROAS limite — à surveiller"
@@ -228,3 +255,31 @@ def kpis_to_dict(k: DashboardKPIs) -> dict[str, Any]:
         "total_campaigns": k.total_campaigns,
         "campaigns": [metrics_to_dict(c) for c in k.campaigns],
     }
+
+
+def generate_hour_zero_targets(
+    selling_price: float,
+    break_even_margin: float,
+    expected_cpm: float = 20.0,
+) -> dict[str, Any]:
+    """
+    Generate target testing compass for campaigns with zero deliveries.
+    """
+    target_cpa = break_even_margin * 0.7
+    required_cvr = 0.03
+    target_cpc = target_cpa * required_cvr
+    if target_cpc > 0:
+        required_ctr = (expected_cpm / 1000.0) / target_cpc
+    else:
+        required_ctr = 0.0
+
+    return {
+        "selling_price": selling_price,
+        "break_even_margin": break_even_margin,
+        "expected_cpm": expected_cpm,
+        "target_cpa": round(target_cpa, 2),
+        "required_cvr": required_cvr,
+        "target_cpc": round(target_cpc, 4),
+        "required_ctr": round(required_ctr, 4),
+    }
+

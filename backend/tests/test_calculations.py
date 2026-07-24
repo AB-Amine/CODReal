@@ -2,6 +2,7 @@ from app.services.calculations import (
     CalculationEngine,
     CampaignInput,
     OrderForCalc,
+    generate_hour_zero_targets,
 )
 
 
@@ -48,3 +49,11 @@ def test_dashboard_aggregation():
     assert kpis.total_delivered == 2
     assert kpis.total_campaigns == 2
     assert kpis.real_roas == 1.25
+
+
+def test_generate_hour_zero_targets():
+    res = generate_hour_zero_targets(selling_price=250.0, break_even_margin=100.0, expected_cpm=20.0)
+    assert res["target_cpa"] == 70.0  # 100 * 0.7
+    assert res["required_cvr"] == 0.03
+    assert res["target_cpc"] == 2.1  # 70 * 0.03
+    assert res["required_ctr"] == 0.0095  # (20 / 1000) / 2.1 = 0.00952...

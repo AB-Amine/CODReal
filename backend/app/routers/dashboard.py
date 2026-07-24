@@ -172,12 +172,23 @@ def full_pipeline(body: PipelineRequest) -> dict:
 
 
 @router.get("/me")
-def dashboard_from_db(user: CurrentUser) -> dict:
-    """Load KPIs for the authenticated user from Supabase."""
+def dashboard_from_db(
+    user: CurrentUser,
+    days: int | None = None,
+    platform: str | None = None,
+) -> dict:
+    """Load KPIs for the authenticated user from Supabase with filtering."""
     settings = get_settings()
     try:
+        # Load user settings for default return fee
+        user_settings = db.get_user_settings(user.id)
+        fee = user_settings.get("return_fee_mad", settings.default_return_fee)
+
         result = db.compute_user_dashboard(
-            user.id, return_fee=settings.default_return_fee
+            user.id,
+            return_fee=fee,
+            days=days,
+            platform=platform,
         )
     except SupabaseNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

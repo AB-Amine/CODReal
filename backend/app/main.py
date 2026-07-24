@@ -14,6 +14,7 @@ from app.routers import (
     jobs,
     matching,
     orders,
+    users,
 )
 
 settings = get_settings()
@@ -47,6 +48,7 @@ app.include_router(matching.router, prefix=prefix)
 app.include_router(dashboard.router, prefix=prefix)
 app.include_router(integrations.router, prefix=prefix)
 app.include_router(jobs.router, prefix=prefix)
+app.include_router(users.router, prefix=prefix)
 
 
 @app.get("/")

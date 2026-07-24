@@ -177,14 +177,22 @@ export async function runBuiltInDemo(): Promise<PipelineResponse> {
   return handle(res);
 }
 
-export async function fetchDashboard(token: string): Promise<{
+export async function fetchDashboard(
+  token: string,
+  days?: number,
+  platform?: string
+): Promise<{
   kpis: DashboardKPIs;
   alerts: AlertItem[];
   campaigns_count: number;
   orders_count: number;
   matches_count: number;
 }> {
-  const res = await apiFetch(`${API_BASE}/api/v1/dashboard/me`, {
+  const params = new URLSearchParams();
+  if (days !== undefined) params.set("days", String(days));
+  if (platform !== undefined) params.set("platform", platform);
+  const q = params.toString() ? `?${params}` : "";
+  const res = await apiFetch(`${API_BASE}/api/v1/dashboard/me${q}`, {
     headers: authHeaders(token),
     cache: "no-store",
   });
@@ -381,6 +389,36 @@ export async function disconnectTikTok(token: string, accountRowId: string): Pro
     }
   );
   await handle(res);
+}
+
+export type UserSettings = {
+  user_id?: string;
+  return_fee_mad: number;
+  critical_return_rate: number;
+  target_roas: number;
+};
+
+export async function fetchUserSettings(token: string): Promise<UserSettings> {
+  const res = await apiFetch(`${API_BASE}/api/v1/users/settings`, {
+    headers: authHeaders(token),
+    cache: "no-store",
+  });
+  return handle(res);
+}
+
+export async function saveUserSettings(
+  token: string,
+  settings: UserSettings
+): Promise<UserSettings> {
+  const res = await apiFetch(`${API_BASE}/api/v1/users/settings`, {
+    method: "POST",
+    headers: {
+      ...authHeaders(token),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(settings),
+  });
+  return handle(res);
 }
 
 export { API_BASE };
