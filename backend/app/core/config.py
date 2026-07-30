@@ -26,10 +26,16 @@ class Settings(BaseSettings):
     # Comma-separated. Production: set CORS_ORIGINS to your Vercel URL(s)
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
-    # Supabase
+    # Supabase (Legacy support)
     supabase_url: str = ""
     supabase_key: str = ""  # service role for backend
     supabase_jwt_secret: str = ""
+
+    # Firebase (Auth + Cloud Firestore)
+    firebase_project_id: str = ""
+    firebase_client_email: str = ""
+    firebase_private_key: str = ""
+    firebase_credentials_json: str = ""
 
     # Token encryption (Fernet key material)
     token_encryption_key: str = ""
@@ -65,6 +71,14 @@ class Settings(BaseSettings):
     @property
     def tiktok_configured(self) -> bool:
         return bool(self.tiktok_app_id and self.tiktok_app_secret)
+
+    @property
+    def firebase_ready(self) -> bool:
+        return bool(
+            self.firebase_project_id
+            or self.firebase_credentials_json
+            or (self.firebase_client_email and self.firebase_private_key)
+        )
 
     @property
     def supabase_ready(self) -> bool:

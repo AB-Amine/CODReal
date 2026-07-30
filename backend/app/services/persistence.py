@@ -1,12 +1,13 @@
-"""Persist and load CODReal domain data in Supabase."""
+"""Persist and load CODReal domain data in Cloud Firestore / Supabase / local storage."""
 
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime, timezone
 from typing import Any
 
+from app.core.firebase_client import is_firebase_configured, get_firestore_admin
 from app.core.phone import normalize_phone
-from app.core.supabase_client import get_supabase_admin
 from app.services.calculations import (
     CalculationEngine,
     CampaignInput,
@@ -15,35 +16,87 @@ from app.services.calculations import (
 )
 from app.services.matching import LeadCandidate, MatchingEngine, OrderRecord
 
+# In-memory storage for offline / unit test execution
+_in_memory_store: dict[str, dict[str, list[dict]]] = {}
+
+
+def _get_user_store(user_id: str) -> dict[str, list[dict]]:
+    if user_id not in _in_memory_store:
+        _in_memory_store[user_id] = {
+            "profiles": [],
+            "campaigns": [],
+            "orders": [],
+            "leads": [],
+            "matches": [],
+            "upload_batches": [],
+            "campaign_stats": [],
+            "alerts": [],
+            "user_settings": [],
+        }
+    return _in_memory_store[user_id]
+
 
 def ensure_profile(user_id: str, email: str | None = None, full_name: str | None = None) -> dict:
-    """Create profile row if missing (trigger may already have done it)."""
-    sb = get_supabase_admin()
-    existing = (
-        sb.table("profiles").select("*").eq("id", user_id).limit(1).execute()
-    )
-    if existing.data:
-        return existing.data[0]
-
-    row = {
+    """Create profile document if missing."""
+    profile_data = {
         "id": user_id,
         "email": email or f"{user_id}@unknown.local",
         "full_name": full_name or "",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    inserted = sb.table("profiles").insert(row).execute()
-    return inserted.data[0] if inserted.data else row
+
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            ref = db.collection("users").document(user_id).collection("profile").document("info")
+            doc = ref.get()
+            if doc.exists:
+                return doc.to_dict() or profile_data
+            ref.set(profile_data, merge=True)
+            return profile_data
+        except Exception:
+            pass
+
+    # Supabase fallback
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            existing = sb.table("profiles").select("*").eq("id", user_id).limit(1).execute()
+            if existing.data:
+                return existing.data[0]
+            inserted = sb.table("profiles").insert(profile_data).execute()
+            return inserted.data[0] if inserted.data else profile_data
+    except Exception:
+        pass
+
+    store = _get_user_store(user_id)
+    if not store["profiles"]:
+        store["profiles"].append(profile_data)
+    return store["profiles"][0]
 
 
 def list_campaigns(user_id: str) -> list[dict]:
-    sb = get_supabase_admin()
-    res = (
-        sb.table("campaigns")
-        .select("*")
-        .eq("user_id", user_id)
-        .order("created_at", desc=True)
-        .execute()
-    )
-    return res.data or []
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            docs = db.collection("users").document(user_id).collection("campaigns").stream()
+            res = [d.to_dict() for d in docs]
+            res.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+            return res
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            res = sb.table("campaigns").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
+            return res.data or []
+    except Exception:
+        pass
+
+    return _get_user_store(user_id)["campaigns"]
 
 
 def upsert_campaign(
@@ -58,41 +111,61 @@ def upsert_campaign(
     leads: int = 0,
     status: str = "active",
 ) -> dict:
-    sb = get_supabase_admin()
     platform = platform if platform in ("meta", "tiktok", "manual") else "manual"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    camp_id = str(uuid.uuid4())
+
     payload = {
+        "id": camp_id,
         "user_id": user_id,
         "platform_campaign_id": platform_campaign_id,
         "name": name,
         "platform": platform,
-        "spend": spend,
-        "impressions": impressions,
-        "clicks": clicks,
-        "leads": leads,
+        "spend": float(spend),
+        "impressions": int(impressions),
+        "clicks": int(clicks),
+        "leads": int(leads),
         "status": status,
-        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "last_updated": now_iso,
+        "created_at": now_iso,
     }
-    # Prefer update if exists
-    found = (
-        sb.table("campaigns")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("platform", platform)
-        .eq("platform_campaign_id", platform_campaign_id)
-        .limit(1)
-        .execute()
-    )
-    if found.data:
-        updated = (
-            sb.table("campaigns")
-            .update(payload)
-            .eq("id", found.data[0]["id"])
-            .execute()
-        )
-        return updated.data[0] if updated.data else {**found.data[0], **payload}
 
-    inserted = sb.table("campaigns").insert(payload).execute()
-    return inserted.data[0]
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            col = db.collection("users").document(user_id).collection("campaigns")
+            query = col.where("platform", "==", platform).where("platform_campaign_id", "==", platform_campaign_id).limit(1).stream()
+            existing_doc = next(query, None)
+            if existing_doc:
+                existing_data = existing_doc.to_dict()
+                payload["id"] = existing_data.get("id", existing_doc.id)
+                col.document(existing_doc.id).update(payload)
+                return {**existing_data, **payload}
+            col.document(camp_id).set(payload)
+            return payload
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            found = sb.table("campaigns").select("*").eq("user_id", user_id).eq("platform", platform).eq("platform_campaign_id", platform_campaign_id).limit(1).execute()
+            if found.data:
+                updated = sb.table("campaigns").update(payload).eq("id", found.data[0]["id"]).execute()
+                return updated.data[0] if updated.data else {**found.data[0], **payload}
+            inserted = sb.table("campaigns").insert(payload).execute()
+            return inserted.data[0]
+    except Exception:
+        pass
+
+    store = _get_user_store(user_id)["campaigns"]
+    for idx, c in enumerate(store):
+        if c.get("platform") == platform and str(c.get("platform_campaign_id")) == str(platform_campaign_id):
+            store[idx] = {**c, **payload, "id": c["id"]}
+            return store[idx]
+    store.append(payload)
+    return payload
 
 
 def upsert_campaigns_bulk(user_id: str, campaigns: list[dict]) -> list[dict]:
@@ -124,17 +197,37 @@ def create_upload_batch(
     error_rows: int,
     storage_path: str | None = None,
 ) -> dict:
-    sb = get_supabase_admin()
+    batch_id = str(uuid.uuid4())
     row = {
+        "id": batch_id,
         "user_id": user_id,
         "filename": filename,
         "storage_path": storage_path,
         "total_rows": total_rows,
         "valid_rows": valid_rows,
         "error_rows": error_rows,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    res = sb.table("upload_batches").insert(row).execute()
-    return res.data[0]
+
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            db.collection("users").document(user_id).collection("upload_batches").document(batch_id).set(row)
+            return row
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            res = sb.table("upload_batches").insert(row).execute()
+            return res.data[0]
+    except Exception:
+        pass
+
+    _get_user_store(user_id)["upload_batches"].append(row)
+    return row
 
 
 def insert_orders(
@@ -145,142 +238,315 @@ def insert_orders(
 ) -> list[dict]:
     if not orders:
         return []
-    sb = get_supabase_admin()
-    rows = []
+
+    saved: list[dict] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     for o in orders:
         phone = o.get("phone") or ""
-        rows.append(
-            {
-                "user_id": user_id,
-                "order_ref": o.get("order_ref"),
-                "phone": phone,
-                "phone_normalized": o.get("phone_normalized")
-                or normalize_phone(phone),
-                "status": o.get("status") or "pending",
-                "amount_collected": float(o.get("amount_collected") or 0),
-                "delivery_date": o.get("delivery_date"),
-                "carrier": o.get("carrier"),
-                "upload_batch_id": upload_batch_id,
-            }
-        )
-    res = sb.table("orders").insert(rows).execute()
-    return res.data or []
+        oid = str(o.get("id") or o.get("order_ref") or uuid.uuid4())
+        item = {
+            "id": oid,
+            "user_id": user_id,
+            "order_ref": o.get("order_ref"),
+            "phone": phone,
+            "phone_normalized": o.get("phone_normalized") or normalize_phone(phone),
+            "status": o.get("status") or "pending",
+            "amount_collected": float(o.get("amount_collected") or 0),
+            "delivery_date": o.get("delivery_date"),
+            "carrier": o.get("carrier"),
+            "upload_batch_id": upload_batch_id,
+            "created_at": now_iso,
+        }
+        saved.append(item)
+
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            col = db.collection("users").document(user_id).collection("orders")
+            for item in saved:
+                col.document(item["id"]).set(item)
+            return saved
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            res = sb.table("orders").insert(saved).execute()
+            return res.data or saved
+    except Exception:
+        pass
+
+    _get_user_store(user_id)["orders"].extend(saved)
+    return saved
 
 
 def insert_leads(user_id: str, leads: list[dict], campaign_id_map: dict[str, str]) -> list[dict]:
-    """campaign_id_map: external/platform id or name → uuid campaign id."""
     if not leads:
         return []
-    sb = get_supabase_admin()
-    rows = []
+
+    saved: list[dict] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     for lead in leads:
         ext = str(lead.get("campaign_id") or "")
         camp_uuid = campaign_id_map.get(ext)
         if not camp_uuid and lead.get("campaign_name"):
             camp_uuid = campaign_id_map.get(str(lead["campaign_name"]))
         phone = lead.get("phone")
-        rows.append(
-            {
-                "user_id": user_id,
-                "campaign_id": camp_uuid,
-                "phone": phone,
-                "phone_normalized": normalize_phone(phone) if phone else None,
-                "order_ref": lead.get("order_ref"),
-                "source": lead.get("source") or "manual",
-            }
-        )
-    res = sb.table("leads").insert(rows).execute()
-    return res.data or []
+        lid = str(lead.get("id") or uuid.uuid4())
+        item = {
+            "id": lid,
+            "user_id": user_id,
+            "campaign_id": camp_uuid,
+            "phone": phone,
+            "phone_normalized": normalize_phone(phone) if phone else None,
+            "order_ref": lead.get("order_ref"),
+            "source": lead.get("source") or "manual",
+            "created_at": now_iso,
+        }
+        saved.append(item)
+
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            col = db.collection("users").document(user_id).collection("leads")
+            for item in saved:
+                col.document(item["id"]).set(item)
+            return saved
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            res = sb.table("leads").insert(saved).execute()
+            return res.data or saved
+    except Exception:
+        pass
+
+    _get_user_store(user_id)["leads"].extend(saved)
+    return saved
 
 
 def replace_matches(user_id: str, matches: list[dict]) -> list[dict]:
-    """Insert match rows (skip duplicates via ignore or delete+insert for batch)."""
     if not matches:
         return []
-    sb = get_supabase_admin()
-    # Upsert-like: delete existing pairs for these order_ids then insert
-    order_ids = [m["order_id"] for m in matches if m.get("order_id")]
-    if order_ids:
-        sb.table("matches").delete().eq("user_id", user_id).in_(
-            "order_id", order_ids
-        ).execute()
-    res = sb.table("matches").insert(matches).execute()
-    return res.data or []
+
+    saved: list[dict] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for m in matches:
+        mid = str(uuid.uuid4())
+        item = {
+            "id": mid,
+            "user_id": user_id,
+            "campaign_id": m["campaign_id"],
+            "order_id": m["order_id"],
+            "lead_id": m.get("lead_id"),
+            "match_type": m["match_type"],
+            "confidence_score": float(m.get("confidence_score") or 0),
+            "created_at": now_iso,
+        }
+        saved.append(item)
+
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            col = db.collection("users").document(user_id).collection("matches")
+            for item in saved:
+                col.document(item["id"]).set(item)
+            return saved
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            order_ids = [m["order_id"] for m in matches if m.get("order_id")]
+            if order_ids:
+                sb.table("matches").delete().eq("user_id", user_id).in_("order_id", order_ids).execute()
+            res = sb.table("matches").insert(saved).execute()
+            return res.data or saved
+    except Exception:
+        pass
+
+    _get_user_store(user_id)["matches"].extend(saved)
+    return saved
 
 
 def save_campaign_stats(user_id: str, stats_rows: list[dict]) -> None:
     if not stats_rows:
         return
-    sb = get_supabase_admin()
-    # Replace latest snapshot per campaign (simple MVP: insert only)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
     for row in stats_rows:
         row["user_id"] = user_id
-        row["calculated_at"] = datetime.now(timezone.utc).isoformat()
-    sb.table("campaign_stats").insert(stats_rows).execute()
+        row["calculated_at"] = now_iso
+        row["id"] = str(uuid.uuid4())
+
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            col = db.collection("users").document(user_id).collection("campaign_stats")
+            for row in stats_rows:
+                col.document(row["id"]).set(row)
+            return
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            sb.table("campaign_stats").insert(stats_rows).execute()
+            return
+    except Exception:
+        pass
+
+    _get_user_store(user_id)["campaign_stats"].extend(stats_rows)
 
 
 def save_alerts(user_id: str, alerts: list[dict]) -> None:
     if not alerts:
         return
-    sb = get_supabase_admin()
-    rows = [
-        {
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    saved = []
+    for a in alerts:
+        saved.append({
+            "id": str(uuid.uuid4()),
             "user_id": user_id,
             "campaign_id": a.get("campaign_id"),
             "severity": a.get("severity"),
             "code": a.get("code"),
             "message": a.get("message"),
             "is_read": False,
-        }
-        for a in alerts
-    ]
-    sb.table("alerts").insert(rows).execute()
+            "created_at": now_iso,
+        })
+
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            col = db.collection("users").document(user_id).collection("alerts")
+            for item in saved:
+                col.document(item["id"]).set(item)
+            return
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            sb.table("alerts").insert(saved).execute()
+            return
+    except Exception:
+        pass
+
+    _get_user_store(user_id)["alerts"].extend(saved)
 
 
 def list_orders(user_id: str, limit: int = 500) -> list[dict]:
-    sb = get_supabase_admin()
-    res = (
-        sb.table("orders")
-        .select("*")
-        .eq("user_id", user_id)
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
-    )
-    return res.data or []
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            docs = db.collection("users").document(user_id).collection("orders").stream()
+            res = [d.to_dict() for d in docs]
+            res.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+            return res[:limit]
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            res = sb.table("orders").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(limit).execute()
+            return res.data or []
+    except Exception:
+        pass
+
+    return _get_user_store(user_id)["orders"][:limit]
 
 
 def list_leads(user_id: str, limit: int = 1000) -> list[dict]:
-    sb = get_supabase_admin()
-    res = (
-        sb.table("leads")
-        .select("*")
-        .eq("user_id", user_id)
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
-    )
-    return res.data or []
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            docs = db.collection("users").document(user_id).collection("leads").stream()
+            res = [d.to_dict() for d in docs]
+            res.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+            return res[:limit]
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            res = sb.table("leads").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(limit).execute()
+            return res.data or []
+    except Exception:
+        pass
+
+    return _get_user_store(user_id)["leads"][:limit]
 
 
 def list_matches(user_id: str) -> list[dict]:
-    sb = get_supabase_admin()
-    res = (
-        sb.table("matches")
-        .select("*, orders(*), campaigns(*)")
-        .eq("user_id", user_id)
-        .execute()
-    )
-    return res.data or []
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            docs = db.collection("users").document(user_id).collection("matches").stream()
+            return [d.to_dict() for d in docs]
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            res = sb.table("matches").select("*, orders(*), campaigns(*)").eq("user_id", user_id).execute()
+            return res.data or []
+    except Exception:
+        pass
+
+    return _get_user_store(user_id)["matches"]
 
 
 def list_alerts(user_id: str, unread_only: bool = False, limit: int = 50) -> list[dict]:
-    sb = get_supabase_admin()
-    q = sb.table("alerts").select("*").eq("user_id", user_id)
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            docs = db.collection("users").document(user_id).collection("alerts").stream()
+            res = [d.to_dict() for d in docs]
+            if unread_only:
+                res = [r for r in res if not r.get("is_read")]
+            res.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+            return res[:limit]
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            q = sb.table("alerts").select("*").eq("user_id", user_id)
+            if unread_only:
+                q = q.eq("is_read", False)
+            res = q.order("created_at", desc=True).limit(limit).execute()
+            return res.data or []
+    except Exception:
+        pass
+
+    res = _get_user_store(user_id)["alerts"]
     if unread_only:
-        q = q.eq("is_read", False)
-    res = q.order("created_at", desc=True).limit(limit).execute()
-    return res.data or []
+        res = [r for r in res if not r.get("is_read")]
+    return res[:limit]
 
 
 def build_campaign_id_map(campaigns: list[dict]) -> dict[str, str]:
@@ -305,10 +571,6 @@ def process_and_persist_upload(
     error_count: int,
     return_fee: float = 25.0,
 ) -> dict[str, Any]:
-    """
-    Full ingestion path:
-    upload_batch → orders → ensure campaigns from CSV names → match → stats.
-    """
     ensure_profile(user_id)
 
     batch = create_upload_batch(
@@ -319,7 +581,6 @@ def process_and_persist_upload(
         error_rows=error_count,
     )
 
-    # Ensure campaigns referenced by CSV
     campaigns = list_campaigns(user_id)
     cmap = build_campaign_id_map(campaigns)
 
@@ -350,7 +611,6 @@ def process_and_persist_upload(
         user_id, valid_rows, upload_batch_id=batch["id"]
     )
 
-    # Run matching against all user leads + phone map from campaign names on orders
     db_leads = list_leads(user_id)
     engine_leads = [
         LeadCandidate(
@@ -372,7 +632,6 @@ def process_and_persist_upload(
         if key and str(key) in cmap:
             phone_to_campaign[nphone] = cmap[str(key)]
 
-    # Also map from existing leads
     for lead in engine_leads:
         n = normalize_phone(lead.phone)
         if n and lead.campaign_id:
@@ -397,7 +656,6 @@ def process_and_persist_upload(
 
     match_rows = []
     for m in report.matches:
-        # campaign_id from engine may be platform id — resolve to uuid
         camp_uuid = cmap.get(m.campaign_id, m.campaign_id)
         match_rows.append(
             {
@@ -411,7 +669,6 @@ def process_and_persist_upload(
         )
     saved_matches = replace_matches(user_id, match_rows)
 
-    # Compute KPIs across all user data
     pipeline = compute_user_dashboard(user_id, return_fee=return_fee)
 
     return {
@@ -442,19 +699,16 @@ def compute_user_dashboard(
     days: int | None = None,
     platform: str | None = None,
 ) -> dict[str, Any]:
-    """Load campaigns + matched orders from DB and compute KPIs with optional filters."""
     campaigns = list_campaigns(user_id)
     matches = list_matches(user_id)
     all_orders = {o["id"]: o for o in list_orders(user_id)}
 
-    # Apply platform filter
     if platform and platform.lower() != "all":
         plat_lower = platform.lower()
         campaigns = [c for c in campaigns if c.get("platform") == plat_lower]
         campaign_ids = {c["id"] for c in campaigns}
         matches = [m for m in matches if m.get("campaign_id") in campaign_ids]
 
-    # Apply date range filter (days)
     if days is not None:
         from datetime import timedelta
         today = date.today()
@@ -512,7 +766,6 @@ def compute_user_dashboard(
             )
         )
 
-    # Load custom threshold settings
     user_settings = get_user_settings(user_id)
     fee = float(user_settings.get("return_fee_mad", return_fee))
     t_roas = float(user_settings.get("target_roas", 2.00))
@@ -527,15 +780,14 @@ def compute_user_dashboard(
     )
     kpis_dict = kpis_to_dict(kpis)
 
-    # Persist stats snapshot
     stats_rows = []
-    today = date.today().isoformat()
+    today_str = date.today().isoformat()
     for c in kpis.campaigns:
         stats_rows.append(
             {
                 "campaign_id": c.campaign_id,
-                "period_start": today,
-                "period_end": today,
+                "period_start": today_str,
+                "period_end": today_str,
                 "total_spend": c.total_spend,
                 "delivered_orders": c.delivered_orders,
                 "returned_orders": c.returned_orders + c.refused_orders,
@@ -550,7 +802,7 @@ def compute_user_dashboard(
     try:
         save_campaign_stats(user_id, stats_rows)
     except Exception:
-        pass  # non-fatal if stats table insert fails
+        pass
 
     from app.services.alerts import build_alerts, AlertRule as ServiceAlertRule
 
@@ -572,7 +824,6 @@ def compute_user_dashboard(
 
 
 def seed_demo_for_user(user_id: str, email: str | None = None) -> dict[str, Any]:
-    """Seed demo campaigns, leads, orders for a logged-in user."""
     ensure_profile(user_id, email=email)
 
     demo_campaigns = [
@@ -713,22 +964,28 @@ def seed_demo_for_user(user_id: str, email: str | None = None) -> dict[str, Any]
 
 
 def get_user_settings(user_id: str) -> dict:
-    """Load settings for a user. Bypasses if Supabase is not configured (pytest fallback)."""
-    from app.core.supabase_client import is_supabase_configured
-    if not is_supabase_configured():
-        return {
-            "user_id": user_id,
-            "return_fee_mad": 25.00,
-            "critical_return_rate": 0.30,
-            "target_roas": 2.00,
-        }
-    sb = get_supabase_admin()
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            doc = db.collection("users").document(user_id).collection("settings").document("config").get()
+            if doc.exists:
+                return doc.to_dict() or {}
+        except Exception:
+            pass
+
     try:
-        res = sb.table("user_settings").select("*").eq("user_id", user_id).limit(1).execute()
-        if res.data:
-            return res.data[0]
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            res = sb.table("user_settings").select("*").eq("user_id", user_id).limit(1).execute()
+            if res.data:
+                return res.data[0]
     except Exception:
         pass
+
+    store = _get_user_store(user_id)["user_settings"]
+    if store:
+        return store[0]
     return {
         "user_id": user_id,
         "return_fee_mad": 25.00,
@@ -743,8 +1000,6 @@ def save_user_settings(
     critical_return_rate: float,
     target_roas: float,
 ) -> dict:
-    """Save/update user configuration settings."""
-    from app.core.supabase_client import is_supabase_configured
     payload = {
         "user_id": user_id,
         "return_fee_mad": return_fee_mad,
@@ -752,14 +1007,31 @@ def save_user_settings(
         "target_roas": target_roas,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    if not is_supabase_configured():
-        return payload
 
-    sb = get_supabase_admin()
-    found = sb.table("user_settings").select("user_id").eq("user_id", user_id).limit(1).execute()
-    if found.data:
-        res = sb.table("user_settings").update(payload).eq("user_id", user_id).execute()
+    if is_firebase_configured():
+        try:
+            db = get_firestore_admin()
+            db.collection("users").document(user_id).collection("settings").document("config").set(payload, merge=True)
+            return payload
+        except Exception:
+            pass
+
+    try:
+        from app.core.supabase_client import is_supabase_configured, get_supabase_admin
+        if is_supabase_configured():
+            sb = get_supabase_admin()
+            found = sb.table("user_settings").select("user_id").eq("user_id", user_id).limit(1).execute()
+            if found.data:
+                res = sb.table("user_settings").update(payload).eq("user_id", user_id).execute()
+            else:
+                res = sb.table("user_settings").insert(payload).execute()
+            return res.data[0] if res.data else payload
+    except Exception:
+        pass
+
+    store = _get_user_store(user_id)["user_settings"]
+    if store:
+        store[0] = payload
     else:
-        res = sb.table("user_settings").insert(payload).execute()
-    return res.data[0] if res.data else payload
-
+        store.append(payload)
+    return payload

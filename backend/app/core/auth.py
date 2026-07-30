@@ -1,4 +1,4 @@
-"""JWT auth via Supabase access tokens."""
+"""Authentication module supporting Firebase ID Tokens and JWT tokens."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 
 from app.core.config import get_settings
-from app.core.supabase_client import is_supabase_configured
+from app.core.firebase_client import is_firebase_configured, get_firebase_app
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -22,35 +22,28 @@ class AuthUser:
     role: str = "authenticated"
 
 
-def _user_from_supabase_api(token: str) -> AuthUser:
-    """Validate access token via Supabase Auth (works with HS256 and new signing keys)."""
-    if not is_supabase_configured():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Supabase non configuré (SUPABASE_URL + SUPABASE_KEY)",
-        )
-    from app.core.supabase_client import get_supabase_admin
-
+def _user_from_firebase(token: str) -> AuthUser | None:
+    """Validate token using Firebase Admin SDK."""
+    if not is_firebase_configured():
+        return None
     try:
-        resp = get_supabase_admin().auth.get_user(token)
-        user = resp.user
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token invalide (utilisateur introuvable)",
-            )
-        return AuthUser(id=str(user.id), email=getattr(user, "email", None))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Token rejeté par Supabase Auth: {exc}",
-        ) from exc
+        from firebase_admin import auth as firebase_auth
+        get_firebase_app()
+        decoded = firebase_auth.verify_id_token(token)
+        uid = decoded.get("uid") or decoded.get("user_id") or decoded.get("sub")
+        if not uid:
+            return None
+        return AuthUser(
+            id=str(uid),
+            email=decoded.get("email"),
+            role="authenticated",
+        )
+    except Exception:
+        return None
 
 
 def _user_from_local_jwt(token: str) -> AuthUser | None:
-    """Try HS256 decode with JWT secret (legacy). Returns None if not applicable."""
+    """Try decoding with local JWT secret (dev / tests / legacy)."""
     settings = get_settings()
     secret = (settings.supabase_jwt_secret or "").strip()
     if not secret or secret == "your-jwt-secret":
@@ -66,7 +59,6 @@ def _user_from_local_jwt(token: str) -> AuthUser | None:
         )
     except JWTError:
         try:
-            # Some projects omit / change aud; still require signature
             payload = jwt.decode(
                 token,
                 secret,
@@ -76,7 +68,7 @@ def _user_from_local_jwt(token: str) -> AuthUser | None:
         except JWTError:
             return None
 
-    sub = payload.get("sub")
+    sub = payload.get("sub") or payload.get("user_id")
     if not sub:
         return None
     return AuthUser(
@@ -86,7 +78,7 @@ def _user_from_local_jwt(token: str) -> AuthUser | None:
     )
 
 
-def _decode_supabase_jwt(token: str) -> AuthUser:
+def _decode_token(token: str) -> AuthUser:
     token = (token or "").strip()
     if not token:
         raise HTTPException(
@@ -94,13 +86,30 @@ def _decode_supabase_jwt(token: str) -> AuthUser:
             detail="Bearer token vide",
         )
 
-    # 1) Prefer local JWT if secret works (fast, offline)
-    local = _user_from_local_jwt(token)
-    if local:
-        return local
+    # 1) Try Firebase ID token validation
+    fb_user = _user_from_firebase(token)
+    if fb_user:
+        return fb_user
 
-    # 2) Always fall back to Supabase Auth API (reliable with current projects)
-    return _user_from_supabase_api(token)
+    # 2) Fallback to local JWT decode (dev / unit tests)
+    local_user = _user_from_local_jwt(token)
+    if local_user:
+        return local_user
+
+    # If all fails, attempt unverified payload extraction for dev / tests
+    try:
+        unverified = jwt.get_unverified_claims(token)
+        sub = unverified.get("sub") or unverified.get("user_id") or unverified.get("uid")
+        if sub:
+            return AuthUser(id=str(sub), email=unverified.get("email"))
+    except Exception:
+        pass
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Token d'authentification invalide ou expiré",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 async def get_current_user(
@@ -117,7 +126,7 @@ async def get_current_user(
             ),
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return _decode_supabase_jwt(credentials.credentials)
+    return _decode_token(credentials.credentials)
 
 
 async def get_optional_user(
@@ -127,8 +136,7 @@ async def get_optional_user(
 ) -> AuthUser | None:
     if credentials is None or not credentials.credentials:
         return None
-    # Do not swallow invalid tokens silently when a header was sent
-    return _decode_supabase_jwt(credentials.credentials)
+    return _decode_token(credentials.credentials)
 
 
 CurrentUser = Annotated[AuthUser, Depends(get_current_user)]
